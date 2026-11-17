@@ -2,6 +2,10 @@ from flask_sqlalchemy import SQLAlchemy
 import openai
 import dotenv
 import logging
+import requests
+import uuid
+import httpx
+import os
 
 # Настройка логгирования
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -10,94 +14,92 @@ logger = logging.getLogger(__name__)
 # Загружаем переменные окружения из файла .env
 try:
     env = dotenv.dotenv_values(".env")
-    YA_API_KEY = env["YA_API_KEY"]
-    YA_FOLDER_ID = env["YA_FOLDER_ID"]
+    GIGACHAT_CREDENTIALS = env["GIGACHAT_CREDENTIALS"]
+    GIGACHAT_SCOPE = env.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 except FileNotFoundError:
     raise FileNotFoundError("Файл .env не найден. Убедитесь, что он существует в корневой директории проекта.")
 except KeyError as e:
     raise KeyError(f"Переменная окружения {str(e)} не найдена в файле .env. Проверьте его содержимое.")
 
+# Путь к сертификату Минцифры (положите файл рядом с models.py)
+CERT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "russian_trusted_root_ca.pem")
 
-# Инициализируем SQLAlchemy для работы с базой данных через Flask
+# Инициализируем SQLAlchemy
 db = SQLAlchemy()
 
 
 class ChatHistory(db.Model):
     """
     Модель SQLAlchemy для хранения истории общения пользователя с LLM.
-
-    Атрибуты:
-        id (int): Уникальный идентификатор записи.
-        user_message (str): Сообщение пользователя.
-        llm_reply (str): Ответ языковой модели.
-        timestamp (datetime): Время создания записи.
     """
-    id = db.Column(db.Integer, primary_key=True)  # Уникальный идентификатор
-    user_message = db.Column(db.Text, nullable=False)  # Текст сообщения пользователя
-    llm_reply = db.Column(db.Text, nullable=False)  # Ответ модели
-    timestamp = db.Column(db.DateTime, server_default=db.func.now())  # Временная метка создания записи
+    id = db.Column(db.Integer, primary_key=True)
+    user_message = db.Column(db.Text, nullable=False)
+    llm_reply = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, server_default=db.func.now())
+
+
+def get_gigachat_token():
+    """
+    Получение Access Token для GigaChat API через OAuth.
+    Возвращает строку токена.
+    """
+    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    payload = f"scope={GIGACHAT_SCOPE}"
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "RqUID": str(uuid.uuid4()),
+        "Authorization": f"Basic {GIGACHAT_CREDENTIALS}",
+    }
+    try:
+        # Используем сертификат Минцифры вместо отключения проверки
+        response = requests.post(url, data=payload, headers=headers, verify=CERT_PATH)
+        response.raise_for_status()
+        return response.json()["access_token"]
+    except Exception as e:
+        logger.error(f"Ошибка получения токена GigaChat: {e}")
+        raise
 
 
 class LLMService:
     """
-    Класс для взаимодействия с внешней языковой моделью (например, YandexGPT).
-
-    Атрибуты:
-        sys_prompt (str): Системный промпт для LLM.
-        client: Клиент OpenAI для обращения к API Yandex.
-        model (str): Идентификатор используемой LLM модели.
+    Класс для взаимодействия с GigaChat через OpenAI-совместимый API.
     """
     def __init__(self, prompt_file):
-        """
-        Инициализация сервиса LLM.
-
-        Аргументы:
-            prompt_file (str): Путь к файлу с системным промптом для LLM.
-        """
-        # Читаем системный промпт из файла и сохраняем в атрибут sys_prompt
         with open(prompt_file, encoding='utf-8') as f:
             self.sys_prompt = f.read()
-                
-        try:
-            # Создаём клиента OpenAI с вашим API-ключом и базовым URL для Yandex LLM API
-            self.client = openai.OpenAI(
-                api_key=YA_API_KEY,
-                base_url="https://llm.api.cloud.yandex.net/v1",
-            )
-            # Формируем путь к модели с использованием идентификатора каталога из .env
-            self.model = f"gpt://{YA_FOLDER_ID}/yandexgpt-lite"
-
-        except Exception as e:
-            logger.error(f"Ошибка при авторизации модели. Проверьте настройки аккаунта и область действия ключа API. {str(e)}")
+        self.model = "GigaChat-2"  # или "GigaChat-2-Pro", "GigaChat-2-Max", "GigaChat-3-Ultra"
 
     def chat(self, message):
         """
-        Отправляет сообщение к языковой модели и возвращает её ответ.
-
-        Аргументы:
-            message (str): Сообщение пользователя.
-
-        Возвращает:
-            str: Ответ языковой модели или сообщение об ошибке.
+        Отправляет сообщение к GigaChat и возвращает ответ.
         """
         try:
-            # Выполняем запрос к API языковой модели
-            response = self.client.chat.completions.create(
+            token = get_gigachat_token()
+
+            # Явно передаём httpx-клиент с сертификатом Минцифры
+            http_client = httpx.Client(verify=CERT_PATH)
+
+            client = openai.OpenAI(
+                api_key=token,
+                base_url="https://api.giga.chat/v1",
+                http_client=http_client,
+            )
+
+            response = client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": self.sys_prompt},
                     {"role": "user", "content": message},
                 ],
-                temperature=1.0,      # Параметр креативности
-                max_tokens=1024,      # Максимальная длина ответа
+                temperature=1.0,
+                max_tokens=1024,
             )
 
-            # Возвращаем текст ответа модели
             return response.choices[0].message.content
 
         except Exception as e:
-            # В случае ошибки возвращаем её описание
-            logger.error(f"Произошла ошибка: {str(e)}")
+            logger.error(f"Ошибка GigaChat: {str(e)}")
             return f"Произошла ошибка: {str(e)}"
 
 
@@ -107,12 +109,5 @@ llm_1 = LLMService('prompts/prompt_1.txt')
 def chat_with_llm(user_message):
     """
     Чат с использованием сервиса LLM.
-
-    Аргументы:
-        user_message (str): Сообщение пользователя.
-
-    Возвращает:
-        str: Ответ LLM.
     """
-    response = llm_1.chat(user_message)
-    return response
+    return llm_1.chat(user_message)

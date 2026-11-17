@@ -2,3 +2,5 @@ flask
 flask_sqlalchemy
 openai
 python-dotenv
+requests
+httpx
